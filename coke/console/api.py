@@ -46,11 +46,14 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/heating", lambda params, body: self._platform.heating_snapshot().as_dict())
+        add("GET", "/api/reversals", self._reversals)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
         add("POST", "/api/quench", self._quench)
         add("POST", "/api/reverse", self._reverse)
+        add("POST", "/api/heating/readback", self._readback)
         add("POST", "/api/clean", self._clean)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
@@ -169,6 +172,19 @@ class Api:
         return self._platform.reverse(
             oven=str(body.get("oven", "oven01")),
             temperature_c=None if temperature is None else float(temperature),
+        )
+
+    def _reversals(self, params: dict, body: dict) -> dict:
+        return {"records": self._platform.reversal_history(limit=int(params.get("limit", 50)))}
+
+    def _readback(self, params: dict, body: dict) -> dict:
+        # 回读缺失（temperature_c 缺省或显式 null）按部分失败处理，不允许静默跳过。
+        if "temperature_c" not in body or body.get("temperature_c") is None:
+            return self._platform.feed_regenerator_readback(
+                None, oven=str(body.get("oven", "oven01"))
+            )
+        return self._platform.feed_regenerator_readback(
+            _as_float(body, "temperature_c", 0.0), oven=str(body.get("oven", "oven01"))
         )
 
     def _clean(self, params: dict, body: dict) -> dict:

@@ -41,7 +41,14 @@
       "reversal_interval_s": 1800.0,
       "temp_target_c": 1180.0,
       "temp_band_c": 35.0,
-      "waste_close_lead_s": 4.0
+      "waste_close_lead_s": 4.0,
+      "reversal_policy": "adaptive",
+      "reversal_interval_min_s": 900.0,
+      "reversal_interval_max_s": 2700.0,
+      "readback_timeout_s": 300.0,
+      "regen_target_c": 1240.0,
+      "regen_band_c": 40.0,
+      "temp_good_ratio": 0.5
     },
     "dust": {
       "damper_open_deg": 70.0,

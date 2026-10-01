@@ -165,31 +165,70 @@ class DoorLimits:
         )
 
 
+REVERSAL_POLICIES = ("adaptive", "fixed")
+
+
 @dataclass(frozen=True)
 class HeatingLimits:
-    """加热换向与炉温确认约束。"""
+    """加热换向与炉温确认约束。
+
+    换向间隔按炉组单独计算（不做全厂统一间隔）：``reversal_interval_s`` 是保守
+    基线，``reversal_policy`` 决定本炉组在炉况好时是拉长间隔省煤气
+    （``"adaptive"``）还是始终按基线保守走（``"fixed"``）。蓄热室温度回读缺失
+    或过期时一律回落到基线间隔。
+    """
 
     reversal_interval_s: float
     temp_target_c: float
     temp_band_c: float
     waste_close_lead_s: float
+    reversal_policy: str
+    reversal_interval_min_s: float
+    reversal_interval_max_s: float
+    readback_timeout_s: float
+    regen_target_c: float
+    regen_band_c: float
+    temp_good_ratio: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "HeatingLimits":
+        policy = section.get("reversal_policy", _MISSING)
+        if policy is _MISSING:
+            raise ConfigError("配置缺少字段 'reversal_policy'", component="config")
+        if policy not in REVERSAL_POLICIES:
+            raise ConfigError(
+                f"换向间隔策略必须是 {REVERSAL_POLICIES} 之一", component="config"
+            )
         limits = cls(
             reversal_interval_s=_number(section, "reversal_interval_s", minimum=1.0),
             temp_target_c=_number(section, "temp_target_c", minimum=1.0),
             temp_band_c=_number(section, "temp_band_c", minimum=1.0),
             waste_close_lead_s=_number(section, "waste_close_lead_s", minimum=0.0),
+            reversal_policy=str(policy),
+            reversal_interval_min_s=_number(section, "reversal_interval_min_s", minimum=1.0),
+            reversal_interval_max_s=_number(section, "reversal_interval_max_s", minimum=1.0),
+            readback_timeout_s=_number(section, "readback_timeout_s", minimum=1.0),
+            regen_target_c=_number(section, "regen_target_c", minimum=1.0),
+            regen_band_c=_number(section, "regen_band_c", minimum=1.0),
+            temp_good_ratio=_number(section, "temp_good_ratio", minimum=0.0),
         )
-        if limits.waste_close_lead_s >= limits.reversal_interval_s:
-            raise ConfigError("废气阀提前关闭时间必须小于换向间隔", component="config")
+        if not limits.reversal_interval_min_s <= limits.reversal_interval_s <= limits.reversal_interval_max_s:
+            raise ConfigError("换向间隔基线必须落在最小与最大间隔之间", component="config")
+        if not 0.0 < limits.temp_good_ratio < 1.0:
+            raise ConfigError("炉况良好阈值必须落在 (0, 1) 区间", component="config")
+        if limits.waste_close_lead_s >= limits.reversal_interval_min_s:
+            raise ConfigError("废气阀提前关闭时间必须小于最小换向间隔", component="config")
         return limits
 
     def confirmed(self, temperature_c: float) -> bool:
         """炉温是否落在确认带内。"""
 
         return abs(temperature_c - self.temp_target_c) <= self.temp_band_c
+
+    def regen_offset_ratio(self, temperature_c: float) -> float:
+        """蓄热室温度偏差占回读带的比例（0 表示正中目标，1 表示贴带边）。"""
+
+        return abs(temperature_c - self.regen_target_c) / self.regen_band_c
 
 
 @dataclass(frozen=True)
@@ -276,7 +315,19 @@ def default_config() -> PlatformConfig:
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
         collector=CollectorLimits(90.0, 18.0, 6.0),
         door=DoorLimits(60.0, 45.0),
-        heating=HeatingLimits(1800.0, 1180.0, 35.0, 4.0),
+        heating=HeatingLimits(
+            reversal_interval_s=1800.0,
+            temp_target_c=1180.0,
+            temp_band_c=35.0,
+            waste_close_lead_s=4.0,
+            reversal_policy="adaptive",
+            reversal_interval_min_s=900.0,
+            reversal_interval_max_s=2700.0,
+            readback_timeout_s=300.0,
+            regen_target_c=1240.0,
+            regen_band_c=40.0,
+            temp_good_ratio=0.5,
+        ),
         dust=DustLimits(70.0, 14.0, 1.5),
     )
 
@@ -325,6 +376,13 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "temp_target_c": cfg.heating.temp_target_c,
                 "temp_band_c": cfg.heating.temp_band_c,
                 "waste_close_lead_s": cfg.heating.waste_close_lead_s,
+                "reversal_policy": cfg.heating.reversal_policy,
+                "reversal_interval_min_s": cfg.heating.reversal_interval_min_s,
+                "reversal_interval_max_s": cfg.heating.reversal_interval_max_s,
+                "readback_timeout_s": cfg.heating.readback_timeout_s,
+                "regen_target_c": cfg.heating.regen_target_c,
+                "regen_band_c": cfg.heating.regen_band_c,
+                "temp_good_ratio": cfg.heating.temp_good_ratio,
             },
             "dust": {
                 "damper_open_deg": cfg.dust.damper_open_deg,

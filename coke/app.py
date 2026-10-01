@@ -28,6 +28,7 @@ from .gas.collector import CollectorMain
 from .gas.flap import BridgeFlap
 from .gas.latch import FlapLatch
 from .guide.machine import GuideCar
+from .heating.advisor import ReversalIntervalAdvisor
 from .heating.machine import HeatingReversal
 from .heating.snapshot import HeatingSnapshot
 from .heating.temperature import OvenTemperature
@@ -85,7 +86,8 @@ class Platform:
         self.collector = CollectorMain(self.config.collector)
         self.flap = BridgeFlap(FlapLatch())
         self.door = DoorCleaner(self.config.door, DoorLatch(self.config.door.latch_travel_mm))
-        self.reversal = HeatingReversal(self.config.heating, self.clock)
+        self.advisor = ReversalIntervalAdvisor(self.config.heating, self.clock)
+        self.reversal = HeatingReversal(self.config.heating, self.clock, advisor=self.advisor)
         self.valves = ValveTrain()
         self.temperature = OvenTemperature(self.config.heating)
         self.dust = DustSystem()
@@ -281,6 +283,44 @@ class Platform:
             self._persist()
             return {**report, **summary}
 
+    def feed_regenerator_readback(self, temperature_c: float | None, oven: str = DEFAULT_OVEN) -> dict:
+        """喂入一次蓄热室温度回读，返回喂入后的间隔决策。
+
+        ``temperature_c`` 为 ``None`` 表示本次回读缺失：属于部分失败，间隔回落
+        保守基线，并按 warning 落审计；平台其余功能不受影响。
+        """
+
+        with self._lock:
+            self.advisor.feed(temperature_c)
+            decision = self.advisor.decide()
+            if temperature_c is None:
+                self.bus.publish(
+                    Event.of(
+                        "heating",
+                        "heating",
+                        "regenerator_readback_missed",
+                        oven=oven,
+                        severity="warning",
+                        message="蓄热室温度回读缺失，按保守间隔处理",
+                        unit=self.unit,
+                        missed=self.advisor.missed(),
+                        **decision.as_dict(),
+                    )
+                )
+            else:
+                self.bus.publish(
+                    Event.of(
+                        "heating",
+                        "heating",
+                        "regenerator_readback",
+                        oven=oven,
+                        severity="notice",
+                        unit=self.unit,
+                        temperature_c=round(float(temperature_c), 2),
+                    )
+                )
+            return decision.as_dict()
+
     def reverse(self, oven: str = DEFAULT_OVEN, temperature_c: float | None = None) -> dict:
         """换向编排：废气阀 → 煤气阀 → 炉温确认。"""
 
@@ -289,6 +329,25 @@ class Platform:
             target_temp = self.config.heating.temp_target_c if temperature_c is None else temperature_c
             report = reverse_heating(self.reversal, self.valves, self.temperature, oven, target_temp)
             report["offset_c"] = self.temperature.offset_c()
+            decision = self.reversal.last_decision()
+            if decision is not None:
+                # 间隔依据与审计同源：排程器本次判定用的决策原样落审计、回控制台。
+                report["interval"] = decision.as_dict()
+                self.bus.publish(
+                    Event.of(
+                        "heating",
+                        "heating",
+                        "reversal_interval_basis",
+                        oven=oven,
+                        op_id=op_id,
+                        severity="warning" if decision.partial_failure else "notice",
+                        message="换向间隔依据（回读缺失，按保守间隔）"
+                        if decision.partial_failure
+                        else "换向间隔依据",
+                        unit=self.unit,
+                        **decision.as_dict(),
+                    )
+                )
             summary = self._record_operation(op_id, "reverse", report)
             summary["op_id"] = op_id
             self._operations += 1
@@ -324,6 +383,7 @@ class Platform:
                 self.schedule.clear()
             self.trend.append("collector_pressure", moment, pressure)
             self.trend.append("damper_angle", moment, angle)
+            self.trend.append("reversal_interval", moment, self.advisor.decide(moment).interval_s)
             self._persist()
             return {
                 "cycle": self._cycles,
@@ -419,7 +479,7 @@ class Platform:
         return self.store.remove("platform_state")
 
     def heating_snapshot(self) -> HeatingSnapshot:
-        """返回加热换向状态快照。"""
+        """返回加热换向状态快照（含当前生效的换向间隔决策）。"""
 
         return HeatingSnapshot(
             waste_gas_open=self.valves.waste_open,
@@ -428,7 +488,27 @@ class Platform:
             confirmed=self.temperature.confirmed(),
             reversals=self.reversal.count(),
             seconds_to_due=self.reversal.seconds_to_due(),
+            interval=self.advisor.decide().as_dict(),
+            readbacks_missed=self.advisor.missed(),
         )
+
+    def reversal_history(self, limit: int = 50) -> list[dict]:
+        """返回最近的换向相关审计记录（最新的在前），供控制台展示。"""
+
+        if limit < 1:
+            raise ValueError("条数必须为正")
+        entries = self.audit.entries(limit=1000)
+        selected = [
+            entry
+            for entry in entries
+            if entry["component"] == "heating"
+            or entry["action"] == "reverse_complete"
+            or (
+                entry["action"] == "interlock_rejected"
+                and entry.get("payload", {}).get("violation") in ("reversal_not_due", "temp_not_confirmed")
+            )
+        ]
+        return selected[:limit]
 
     def dust_snapshot(self) -> DustSnapshot:
         """返回除尘状态快照。"""

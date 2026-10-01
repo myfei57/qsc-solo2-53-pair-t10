@@ -71,7 +71,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     startup = platform.start()
     charge = platform.charge(oven="oven01", hopper_target_mm=0.0, hopper_measured_mm=0.0)
     disturbance = platform.disturb_collector(delta_pa=-45.0)
-    clock.advance(config.heating.reversal_interval_s)
+    # 喂一次蓄热室温度回读，让换向间隔按炉况实时决策，再按生效间隔推进时钟。
+    interval_decision = platform.feed_regenerator_readback(config.heating.regen_target_c, oven="oven01")
+    clock.advance(interval_decision["interval_s"])
     reversal = platform.reverse(oven="oven01", temperature_c=config.heating.temp_target_c)
     push = platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=0.0)
     quench = platform.quench(oven="oven01")
@@ -91,7 +93,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "startup": startup,
         "charge": {"ok": charge["ok"], "steps": [step["action"] for step in charge["steps"]]},
         "disturbance": disturbance,
-        "reversal": {"ok": reversal["ok"], "steps": [step["action"] for step in reversal["steps"]]},
+        "interval_decision": interval_decision,
+        "reversal": {
+            "ok": reversal["ok"],
+            "steps": [step["action"] for step in reversal["steps"]],
+            "interval_basis": reversal.get("interval"),
+        },
         "push": {"ok": push["ok"], "steps": [step["action"] for step in push["steps"]]},
         "quench": {"ok": quench["ok"], "steps": [step["action"] for step in quench["steps"]]},
         "cycles_run": len(cycles),

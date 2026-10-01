@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,8 @@ class HeatingSnapshot:
     confirmed: bool
     reversals: int
     seconds_to_due: float
+    interval: dict = field(default_factory=dict)
+    readbacks_missed: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -24,4 +26,6 @@ class HeatingSnapshot:
             "confirmed": self.confirmed,
             "reversals": self.reversals,
             "seconds_to_due": round(self.seconds_to_due, 2),
+            "interval": dict(self.interval),
+            "readbacks_missed": self.readbacks_missed,
         }
