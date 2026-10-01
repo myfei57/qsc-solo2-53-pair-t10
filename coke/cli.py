@@ -73,6 +73,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     disturbance = platform.disturb_collector(delta_pa=-45.0)
     clock.advance(config.heating.reversal_interval_s)
     reversal = platform.reverse(oven="oven01", temperature_c=config.heating.temp_target_c)
+    # 蓄热室温度回读驱动换向间隔：炉温有余量时按炉组模式拉长间隔省煤气；
+    # 回读缺失属于部分失败，间隔回落保守值。
+    margin_temp = config.heating.temp_target_c + config.heating.temp_band_c + 5.0
+    governance_feeds = [platform.feed_regenerator_temperature(margin_temp, clock.now()) for _ in range(3)]
+    governance_missing = platform.feed_regenerator_temperature()
     push = platform.push(oven="oven01", guide_target_mm=0.0, guide_measured_mm=0.0)
     quench = platform.quench(oven="oven01")
     cycles = [platform.cycle(dt=1.0) for _ in range(8)]
@@ -92,6 +97,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "charge": {"ok": charge["ok"], "steps": [step["action"] for step in charge["steps"]]},
         "disturbance": disturbance,
         "reversal": {"ok": reversal["ok"], "steps": [step["action"] for step in reversal["steps"]]},
+        "interval_governance": {
+            "mode": platform.governor.mode(),
+            "feed_intervals_s": [item["interval_s"] for item in governance_feeds],
+            "missing_interval_s": governance_missing["interval_s"],
+            "missing_reason": governance_missing["reason"],
+        },
         "push": {"ok": push["ok"], "steps": [step["action"] for step in push["steps"]]},
         "quench": {"ok": quench["ok"], "steps": [step["action"] for step in quench["steps"]]},
         "cycles_run": len(cycles),
@@ -108,6 +119,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     for operation in (charge, reversal, push, quench, cleaning):
         if not operation["ok"]:
             failures.extend(operation["violations"])
+    if governance_missing["reason"] != "readback_missing":
+        failures.append("interval_fallback")
+    if platform.governor.mode() == "economy" and not (
+        governance_feeds[-1]["interval_s"] > config.heating.reversal_interval_s
+    ):
+        failures.append("interval_extend")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

@@ -3,7 +3,8 @@
 ``Platform`` 把各组件按真实调用链接起来，并暴露四件事：操作编排（装煤、
 推焦、熄焦、换向、炉门清扫）、控制循环、并发仲裁探测和状态快照。控制循环
 每个周期做三件事：把集气管压力调向目标带、按推焦联动时序驱动除尘挡板、
-采集趋势；换向与推焦这类跨模块动作都由编排一次性走完并写审计。
+采集趋势；换向与推焦这类跨模块动作都由编排一次性走完并写审计。换向间隔
+由调节器按炉组根据蓄热室温度回读自动调整，回读缺失时回落保守间隔。
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from .gas.collector import CollectorMain
 from .gas.flap import BridgeFlap
 from .gas.latch import FlapLatch
 from .guide.machine import GuideCar
+from .heating.governor import IntervalDecision, IntervalGovernor
 from .heating.machine import HeatingReversal
 from .heating.snapshot import HeatingSnapshot
 from .heating.temperature import OvenTemperature
@@ -85,7 +87,8 @@ class Platform:
         self.collector = CollectorMain(self.config.collector)
         self.flap = BridgeFlap(FlapLatch())
         self.door = DoorCleaner(self.config.door, DoorLatch(self.config.door.latch_travel_mm))
-        self.reversal = HeatingReversal(self.config.heating, self.clock)
+        self.governor = IntervalGovernor(unit, self.config.heating, self.config.reversal, self.clock)
+        self.reversal = HeatingReversal(self.config.heating, self.clock, governor=self.governor)
         self.valves = ValveTrain()
         self.temperature = OvenTemperature(self.config.heating)
         self.dust = DustSystem()
@@ -139,8 +142,8 @@ class Platform:
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
 
-    def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
-        """把编排步骤逐条写审计，并记一条汇总事件。"""
+    def _record_operation(self, op_id: str, operation: str, report: dict, extra: dict | None = None) -> dict:
+        """把编排步骤逐条写审计，并记一条汇总事件（``extra`` 并入汇总口径）。"""
 
         oven = str(report.get("oven", ""))
         for step in report.get("steps", []):
@@ -181,6 +184,8 @@ class Platform:
             "ok": bool(report.get("ok")),
             "violations": list(report.get("violations", [])),
         }
+        if extra:
+            summary.update(extra)
         self.bus.publish(
             Event.of(
                 "audit",
@@ -192,6 +197,55 @@ class Platform:
             )
         )
         return summary
+
+    def _publish_decision(self, decision: IntervalDecision) -> None:
+        """把一次间隔决策发布到总线（控制台展示与审计留存读同一条）。"""
+
+        payload = decision.as_dict()
+        if decision.partial_failure():
+            severity = "warning"
+            message = f"蓄热室温度回读缺失（{decision.readback_quality}），换向间隔回落保守值"
+        else:
+            severity = "notice"
+            message = f"换向间隔决策：{decision.reason}"
+        self.bus.publish(
+            Event.of("heating", "heating", "interval_decision", severity=severity, message=message, **payload)
+        )
+
+    def feed_regenerator_temperature(
+        self, temperature_c: float | None = None, sampled_at: float | None = None
+    ) -> dict:
+        """喂入一次蓄热室温度回读，返回本次换向间隔决策。
+
+        回读缺失（未给温度、非数值、超龄或采样时间戳在未来）按部分失败处理：
+        间隔回落保守值并记 warning 审计；系统不闭锁，换向编排的阀序不受影响。
+        """
+
+        with self._lock:
+            decision = self.governor.decide(temperature_c, sampled_at)
+            self._publish_decision(decision)
+            return decision.as_dict()
+
+    def reversal_status(self, limit: int = 50) -> dict:
+        """换向记录与间隔决策（控制台展示用；与审计同一份来源，口径一致）。"""
+
+        with self._lock:
+            limit = max(1, min(int(limit), 500))
+            entries = self.audit.entries(limit=1024)
+            decisions = [entry for entry in entries if entry["action"] == "interval_decision"][:limit]
+            reversals = [entry for entry in entries if entry["action"] == "reverse_complete"][:limit]
+            last = self.governor.last_decision()
+            return {
+                "group": self.unit,
+                "mode": self.governor.mode(),
+                "current_interval_s": round(self.governor.current_interval_s(), 2),
+                "base_interval_s": self.config.heating.reversal_interval_s,
+                "min_interval_s": self.config.reversal.min_interval_s,
+                "max_interval_s": self.config.reversal.max_interval_s,
+                "last_decision": last.as_dict() if last is not None else None,
+                "decisions": decisions,
+                "reversals": reversals,
+            }
 
     def start(self) -> dict:
         """启动平台：启动除尘风机并核对拓扑。"""
@@ -282,14 +336,24 @@ class Platform:
             return {**report, **summary}
 
     def reverse(self, oven: str = DEFAULT_OVEN, temperature_c: float | None = None) -> dict:
-        """换向编排：废气阀 → 煤气阀 → 炉温确认。"""
+        """换向编排：废气阀 → 煤气阀 → 炉温确认；记录携带当次生效的间隔依据。"""
 
         with self._lock:
             op_id = self.ids.next()
+            stale = self.governor.refresh()
+            if stale is not None:
+                self._publish_decision(stale)
             target_temp = self.config.heating.temp_target_c if temperature_c is None else temperature_c
             report = reverse_heating(self.reversal, self.valves, self.temperature, oven, target_temp)
             report["offset_c"] = self.temperature.offset_c()
-            summary = self._record_operation(op_id, "reverse", report)
+            last = self.governor.last_decision()
+            extra = {
+                "interval_s": round(self.governor.current_interval_s(), 2),
+                "interval_mode": self.governor.mode(),
+                "interval_reason": last.reason if last is not None else None,
+                "interval_decision_seq": last.seq if last is not None else None,
+            }
+            summary = self._record_operation(op_id, "reverse", report, extra)
             summary["op_id"] = op_id
             self._operations += 1
             self._persist()
@@ -315,6 +379,9 @@ class Platform:
         with self._lock:
             self._cycles += 1
             moment = self.clock.now()
+            stale = self.governor.refresh(moment)
+            if stale is not None:
+                self._publish_decision(stale)
             before = self.collector.pressure_pa
             pressure = self.collector.regulate(dt)
             linkage = self.schedule.due(moment)
@@ -428,6 +495,8 @@ class Platform:
             confirmed=self.temperature.confirmed(),
             reversals=self.reversal.count(),
             seconds_to_due=self.reversal.seconds_to_due(),
+            interval_s=self.governor.current_interval_s(),
+            interval_mode=self.governor.mode(),
         )
 
     def dust_snapshot(self) -> DustSnapshot:

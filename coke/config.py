@@ -1,9 +1,9 @@
 """平台配置。
 
 配置来自 JSON 文件（标准库解析），覆盖推焦行程基线、导焦栅对齐公差、集气
-管压力带、熄焦喷淋时长、换向间隔、炉温确认带、除尘挡板联动参数与存储目录。
-任何缺失或越界取值都在装配阶段抛出 :class:`ConfigError`，不允许带着半份
-配置启动控制链。
+管压力带、熄焦喷淋时长、换向间隔与其自动调节、炉温确认带、除尘挡板联动参
+数与存储目录。任何缺失或越界取值都在装配阶段抛出 :class:`ConfigError`，不
+允许带着半份配置启动控制链。
 """
 
 from __future__ import annotations
@@ -192,6 +192,61 @@ class HeatingLimits:
         return abs(temperature_c - self.temp_target_c) <= self.temp_band_c
 
 
+REVERSAL_MODES = ("economy", "conservative")
+
+
+@dataclass(frozen=True)
+class ReversalLimits:
+    """换向间隔自动调节约束（按炉组单独生效，全厂不设统一间隔）。
+
+    ``groups`` 按炉组给出模式：``economy`` 表示炉况好时拉长间隔省煤气，
+    ``conservative`` 表示按固定间隔保守走；未单独列出的炉组用
+    ``default_mode``。``heating.reversal_interval_s`` 保留为保守间隔——
+    温度回读缺失（部分失败）时间隔回落到它。
+    """
+
+    default_mode: str
+    min_interval_s: float
+    max_interval_s: float
+    adjust_step_s: float
+    readback_max_age_s: float
+    groups: Mapping[str, str]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "ReversalLimits":
+        default_mode = section.get("default_mode", _MISSING)
+        if default_mode is _MISSING:
+            raise ConfigError("配置缺少字段 'default_mode'", component="config")
+        if default_mode not in REVERSAL_MODES:
+            raise ConfigError(f"换向间隔模式必须是 {REVERSAL_MODES} 之一", component="config")
+        raw_groups = section.get("groups", {})
+        if not isinstance(raw_groups, Mapping):
+            raise ConfigError("配置字段 'groups' 必须是映射", component="config")
+        groups: dict[str, str] = {}
+        for group, mode in raw_groups.items():
+            if not isinstance(group, str) or not group:
+                raise ConfigError("换向间隔炉组名必须是非空字符串", component="config")
+            if mode not in REVERSAL_MODES:
+                raise ConfigError(f"炉组 {group!r} 的换向间隔模式非法", component="config")
+            groups[group] = mode
+        limits = cls(
+            default_mode=default_mode,
+            min_interval_s=_number(section, "min_interval_s", minimum=1.0),
+            max_interval_s=_number(section, "max_interval_s", minimum=1.0),
+            adjust_step_s=_number(section, "adjust_step_s", minimum=0.1),
+            readback_max_age_s=_number(section, "readback_max_age_s", minimum=1.0),
+            groups=groups,
+        )
+        if not limits.min_interval_s < limits.max_interval_s:
+            raise ConfigError("换向间隔下限必须小于上限", component="config")
+        return limits
+
+    def mode_for(self, group: str) -> str:
+        """返回指定炉组的间隔模式（未单独配置的炉组用默认模式）。"""
+
+        return self.groups.get(group, self.default_mode)
+
+
 @dataclass(frozen=True)
 class DustLimits:
     """除尘挡板联动约束。"""
@@ -225,6 +280,7 @@ class PlatformConfig:
     collector: CollectorLimits
     door: DoorLimits
     heating: HeatingLimits
+    reversal: ReversalLimits
     dust: DustLimits
 
     @classmethod
@@ -238,6 +294,10 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        heating = HeatingLimits.from_mapping(_section(limits, "heating"))
+        reversal = ReversalLimits.from_mapping(_section(limits, "reversal"))
+        if not reversal.min_interval_s <= heating.reversal_interval_s <= reversal.max_interval_s:
+            raise ConfigError("保守换向间隔必须落在换向间隔调节上下限之间", component="config")
         return cls(
             name=name,
             storage_root=storage_root,
@@ -247,7 +307,8 @@ class PlatformConfig:
             quench=QuenchLimits.from_mapping(_section(limits, "quench")),
             collector=CollectorLimits.from_mapping(_section(limits, "collector")),
             door=DoorLimits.from_mapping(_section(limits, "door")),
-            heating=HeatingLimits.from_mapping(_section(limits, "heating")),
+            heating=heating,
+            reversal=reversal,
             dust=DustLimits.from_mapping(_section(limits, "dust")),
         )
 
@@ -277,6 +338,10 @@ def default_config() -> PlatformConfig:
         collector=CollectorLimits(90.0, 18.0, 6.0),
         door=DoorLimits(60.0, 45.0),
         heating=HeatingLimits(1800.0, 1180.0, 35.0, 4.0),
+        reversal=ReversalLimits(
+            "conservative", 1200.0, 2700.0, 60.0, 120.0,
+            {"battery1": "economy", "battery2": "conservative"},
+        ),
         dust=DustLimits(70.0, 14.0, 1.5),
     )
 
@@ -325,6 +390,14 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "temp_target_c": cfg.heating.temp_target_c,
                 "temp_band_c": cfg.heating.temp_band_c,
                 "waste_close_lead_s": cfg.heating.waste_close_lead_s,
+            },
+            "reversal": {
+                "default_mode": cfg.reversal.default_mode,
+                "min_interval_s": cfg.reversal.min_interval_s,
+                "max_interval_s": cfg.reversal.max_interval_s,
+                "adjust_step_s": cfg.reversal.adjust_step_s,
+                "readback_max_age_s": cfg.reversal.readback_max_age_s,
+                "groups": dict(cfg.reversal.groups),
             },
             "dust": {
                 "damper_open_deg": cfg.dust.damper_open_deg,

@@ -15,6 +15,8 @@ class HeatingSnapshot:
     confirmed: bool
     reversals: int
     seconds_to_due: float
+    interval_s: float
+    interval_mode: str
 
     def as_dict(self) -> dict:
         return {
@@ -24,4 +26,6 @@ class HeatingSnapshot:
             "confirmed": self.confirmed,
             "reversals": self.reversals,
             "seconds_to_due": round(self.seconds_to_due, 2),
+            "interval_s": round(self.interval_s, 2),
+            "interval_mode": self.interval_mode,
         }

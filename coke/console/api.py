@@ -45,12 +45,14 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/reversals", self._reversals)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
         add("POST", "/api/push", self._push)
         add("POST", "/api/quench", self._quench)
         add("POST", "/api/reverse", self._reverse)
+        add("POST", "/api/heating/readback", self._heating_readback)
         add("POST", "/api/clean", self._clean)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
@@ -170,6 +172,21 @@ class Api:
             oven=str(body.get("oven", "oven01")),
             temperature_c=None if temperature is None else float(temperature),
         )
+
+    def _reversals(self, params: dict, body: dict) -> dict:
+        return self._platform.reversal_status(limit=int(params.get("limit", 50)))
+
+    def _heating_readback(self, params: dict, body: dict) -> dict:
+        raw_temp = body.get("temperature_c")
+        raw_ts = body.get("sampled_at")
+        temperature_c = None if raw_temp is None else _as_float(body, "temperature_c", 0.0)
+        if raw_ts is None:
+            # 现场只推温度不带时间戳时，按当前时刻采样；整条回读缺失则保持缺失，
+            # 让平台按部分失败回落保守间隔。
+            sampled_at = self._platform.clock.now() if temperature_c is not None else None
+        else:
+            sampled_at = _as_float(body, "sampled_at", 0.0)
+        return self._platform.feed_regenerator_temperature(temperature_c=temperature_c, sampled_at=sampled_at)
 
     def _clean(self, params: dict, body: dict) -> dict:
         return self._platform.clean(
